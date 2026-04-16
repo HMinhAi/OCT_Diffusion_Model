@@ -1,0 +1,88 @@
+project:
+  seed: 42
+  output_dir: outputs
+  checkpoint_dir: checkpoints
+  num_workers: 4
+  device: auto
+
+dataset:
+  root: datasets/OCT2017
+  train_dir: train
+  test_dir: test
+  normal_class_name: NORMAL
+  abnormal_class_names: [CNV, DME, DRUSEN]
+  mask_dir: masks
+  image_size: 256
+  normalize_mean: [0.5, 0.5, 0.5]
+  normalize_std: [0.5, 0.5, 0.5]
+  use_kaggle_download: false
+  kaggle:
+    dataset_slug: paultimothymooney/kermany2018
+    download_dir: data
+    unzip: true
+
+train:
+  batch_size: 8
+  epochs_diffusion: 100
+  epochs_fusion: 20
+  lr_diffusion: 1.0e-4
+  lr_fusion: 1.0e-4
+  weight_decay: 0.0
+  amp: true
+  log_interval: 20
+  save_every: 5
+  pseudo_label_quantile: 0.9
+  max_train_images: null
+  max_test_images: null
+
+diffusion:
+  timesteps: 1000
+  beta_start: 1.0e-4
+  beta_end: 0.02
+  model_channels: 64
+  channel_mult: [1, 2, 4, 8]
+  num_res_blocks: 2
+  dropout: 0.0
+  anomaly_distance: l1
+  inversion_steps: 50
+
+inference:
+  simplex_noise_scale: 0.08
+  simplex_octaves: 3
+  simplex_runs: 4
+  noise_aggregate: mean
+  lambda_correction: 0.5
+  score_blend_noise_weight: 0.3
+  threshold_percentile: 95
+
+feature:
+  backbone: resnet50
+  pretrained: true
+  layer: layer3
+  diagonal_covariance: true
+  covariance_eps: 1.0e-3
+  fit_max_samples: 20000
+
+fusion:
+  hidden_channels: 32
+
+ablation:
+  enable_diffusion: true
+  enable_feature_correction: true
+  enable_simplex_noise: true
+  enable_attention_fusion: true
+  enable_noise_space_error: true
+
+wandb:
+  enabled: true
+  project: oct-diffusion-anomaly
+  entity: null
+  name: null
+  tags: [ddpm, inversion, oct, anomaly]
+  mode: online
+  log_images_every: 50
+
+eval:
+  batch_size: 4
+  save_visualizations: true
+  max_visualizations: 50
