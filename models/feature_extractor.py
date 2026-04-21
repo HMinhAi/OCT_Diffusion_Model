@@ -97,12 +97,16 @@ class MahalanobisFeatureModel(nn.Module):
         self.encoder.eval()
 
         chunks = []
+        collected = 0
         for batch in train_loader:
             images = batch["image"].to(device)
             feat = self.encoder(images)
             b, c, h, w = feat.shape
             feat_flat = feat.permute(0, 2, 3, 1).reshape(-1, c)
             chunks.append(feat_flat.detach().cpu())
+            collected += feat_flat.shape[0]
+            if collected >= self.fit_max_samples:
+                break
 
         if not chunks:
             raise RuntimeError("No features collected to fit Mahalanobis model.")

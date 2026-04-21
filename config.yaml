@@ -2,7 +2,7 @@ project:
   seed: 42
   output_dir: outputs
   checkpoint_dir: checkpoints
-  num_workers: 4
+  num_workers: auto
   device: auto
 
 dataset:
@@ -22,8 +22,8 @@ dataset:
     unzip: true
 
 train:
-  batch_size: 8
-  epochs_diffusion: 100
+  batch_size: auto
+  epochs_diffusion: 1
   epochs_fusion: 20
   lr_diffusion: 1.0e-4
   lr_fusion: 1.0e-4
@@ -36,15 +36,15 @@ train:
   max_test_images: null
 
 diffusion:
-  timesteps: 1000
+  timesteps: 500 #1000
   beta_start: 1.0e-4
   beta_end: 0.02
   model_channels: 64
-  channel_mult: [1, 2, 4, 8]
+  channel_mult: [1, 2, 4]  #[1, 2, 4, 8]
   num_res_blocks: 2
-  dropout: 0.0
+  dropout: 0.2
   anomaly_distance: l1
-  inversion_steps: 50
+  inversion_steps: 30  # số lần chạy Unet
 
 inference:
   simplex_noise_scale: 0.08
@@ -83,6 +83,6 @@ wandb:
   log_images_every: 50
 
 eval:
-  batch_size: 4
+  batch_size: auto
   save_visualizations: true
   max_visualizations: 50

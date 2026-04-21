@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
+import os
 import random
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -26,6 +28,50 @@ from models.inversion import DiffusionInversionDetector, apply_deviation_correct
 from utils.metrics import min_max_normalize
 
 LOGGER = logging.getLogger("oct_train")
+
+
+def detect_hardware() -> Dict:
+    info: Dict = {
+        "device_name": "CPU",
+        "vram_gb": 0.0,
+        "sm_count": 0,
+        "cpu_cores": os.cpu_count() or 4,
+        "gpu_count": torch.cuda.device_count(),
+    }
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        props = torch.cuda.get_device_properties(0)
+        info["device_name"] = props.name
+        info["vram_gb"] = props.total_memory / (1024 ** 3)
+        info["sm_count"] = props.multi_processor_count
+    return info
+
+
+def apply_hardware_config(config: Dict, hw: Dict) -> Dict:
+    config = copy.deepcopy(config)
+    cpu_cores: int = hw["cpu_cores"]
+    vram_gb: float = hw["vram_gb"]
+
+    if str(config["project"].get("num_workers", 4)).lower() == "auto":
+        workers = min(max(cpu_cores // 2, 2), 8)
+        config["project"]["num_workers"] = workers
+        LOGGER.info("Auto num_workers=%d  (cpu_cores=%d)", workers, cpu_cores)
+
+    def _resolve_batch(key: str, section: str, default: int) -> None:
+        if str(config[section].get(key, default)).lower() == "auto":
+            if vram_gb >= 24:
+                bs = 32
+            elif vram_gb >= 16:
+                bs = 16
+            elif vram_gb >= 8:
+                bs = 8
+            else:
+                bs = 4
+            config[section][key] = bs
+            LOGGER.info("Auto %s[%s]=%d  (vram=%.1fGB)", section, key, bs, vram_gb)
+
+    _resolve_batch("batch_size", "train", 8)
+    _resolve_batch("batch_size", "eval", 4)
+    return config
 
 
 def load_config(config_path: str) -> Dict:
@@ -400,8 +446,20 @@ def main() -> None:
     seed = int(config["project"].get("seed", 42))
     set_seed(seed)
 
+    hw = detect_hardware()
+    LOGGER.info(
+        "Hardware: %s | VRAM=%.1fGB | SMs=%d | CPU cores=%d | GPUs=%d",
+        hw["device_name"], hw["vram_gb"], hw["sm_count"], hw["cpu_cores"], hw["gpu_count"],
+    )
+    config = apply_hardware_config(config, hw)
+
     device = get_device(config)
     LOGGER.info("Using device: %s", device)
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     output_dir = Path(config["project"].get("output_dir", "outputs"))
     checkpoint_dir = Path(config["project"].get("checkpoint_dir", "checkpoints"))

@@ -210,3 +210,4 @@ datasets/
 wandb/
 checkpoints/
 outputs/
+.claude/settings.local.json
