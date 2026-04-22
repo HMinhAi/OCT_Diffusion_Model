@@ -52,17 +52,17 @@ def apply_hardware_config(config: Dict, hw: Dict) -> Dict:
     vram_gb: float = hw["vram_gb"]
 
     if str(config["project"].get("num_workers", 4)).lower() == "auto":
-        workers = min(max(cpu_cores // 2, 2), 8)
+        workers = min(max(cpu_cores // 2, 2), 12)
         config["project"]["num_workers"] = workers
         LOGGER.info("Auto num_workers=%d  (cpu_cores=%d)", workers, cpu_cores)
 
     def _resolve_batch(key: str, section: str, default: int) -> None:
         if str(config[section].get(key, default)).lower() == "auto":
-            if vram_gb >= 24:
+            if vram_gb >= 23:
                 bs = 32
-            elif vram_gb >= 16:
+            elif vram_gb >= 14:
                 bs = 16
-            elif vram_gb >= 8:
+            elif vram_gb >= 7:
                 bs = 8
             else:
                 bs = 4
@@ -168,7 +168,7 @@ def _build_pseudo_labels(
     return 0.5 * soft_map + 0.5 * hard_map
 
 
-def _init_wandb(config: Dict, disable_wandb: bool):
+def _init_wandb(config: Dict, hw: Dict, disable_wandb: bool):
     wb_cfg = config.get("wandb", {})
     enabled = bool(wb_cfg.get("enabled", False)) and not disable_wandb
     if not enabled:
@@ -176,13 +176,22 @@ def _init_wandb(config: Dict, disable_wandb: bool):
     if wandb is None:
         raise ImportError("wandb is enabled in config but not installed.")
 
+    wandb_config = copy.deepcopy(config)
+    wandb_config["hardware"] = {
+        "gpu_name": hw["device_name"],
+        "vram_gb": round(hw["vram_gb"], 1),
+        "sm_count": hw["sm_count"],
+        "gpu_count": hw["gpu_count"],
+        "cpu_cores": hw["cpu_cores"],
+    }
+
     return wandb.init(
         project=wb_cfg.get("project", "oct-diffusion-anomaly"),
         entity=wb_cfg.get("entity", None),
         name=wb_cfg.get("name", None),
         tags=wb_cfg.get("tags", []),
         mode=wb_cfg.get("mode", "online"),
-        config=config,
+        config=wandb_config,
     )
 
 
@@ -468,7 +477,7 @@ def main() -> None:
 
     save_checkpoint(checkpoint_dir / "run_config.pt", {"config": config})
 
-    wb_run = _init_wandb(config, disable_wandb=args.disable_wandb)
+    wb_run = _init_wandb(config, hw=hw, disable_wandb=args.disable_wandb)
 
     loaders = create_oct_dataloaders(config)
     train_loader = loaders["train"]
