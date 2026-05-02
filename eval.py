@@ -157,8 +157,8 @@ def evaluate_pipeline(
         for batch in test_loader:
             images = batch["image"].to(device, non_blocking=True)
             labels = batch["label"].cpu().numpy()
-            masks = batch["mask"].to(device, non_blocking=True)
-            has_mask = batch["has_mask"].to(device, non_blocking=True)
+            # masks = batch["mask"].to(device, non_blocking=True)
+            # has_mask = batch["has_mask"].to(device, non_blocking=True)
             paths = batch["path"]
 
             maps = _build_source_maps(images, detector, feature_model, config)
@@ -175,19 +175,19 @@ def evaluate_pipeline(
                     combined.append(noise_map)
                 final_map = torch.stack(combined, dim=0).mean(dim=0)
 
-            final_map = min_max_normalize(final_map)
+            # final_map = min_max_normalize(final_map)
             score_tensor = anomaly_map_to_image_score(final_map, reduction="max")
 
             image_labels.extend(labels.tolist())
             image_scores.extend(score_tensor.detach().cpu().numpy().tolist())
 
-            batch_pixel_maps, batch_pixel_masks = extract_pixel_lists(
-                batch_maps=final_map,
-                batch_masks=masks,
-                batch_has_mask=has_mask,
-            )
-            pixel_maps.extend(batch_pixel_maps)
-            pixel_masks.extend(batch_pixel_masks)
+            # batch_pixel_maps, batch_pixel_masks = extract_pixel_lists(
+            #     batch_maps=final_map,
+            #     batch_masks=masks,
+            #     batch_has_mask=has_mask,
+            # )
+            # pixel_maps.extend(batch_pixel_maps)
+            # pixel_masks.extend(batch_pixel_masks)
 
             if save_visualizations and vis_counter < max_visualizations:
                 for i in range(images.shape[0]):
@@ -209,10 +209,11 @@ def evaluate_pipeline(
 
     image_auc = compute_image_auroc(image_labels, image_scores)
 
-    pixel_available = len(pixel_maps) > 0
-    if pixel_available:
-        pixel_auc = compute_pixel_auroc(pixel_maps, pixel_masks)
-    else:
+    pixel_available = False
+    # if pixel_available:
+    #     pixel_auc = compute_pixel_auroc(pixel_maps, pixel_masks)
+    # else:
+    if pixel_available == False:
         pixel_auc = float("nan")
         LOGGER.warning("No pixel-level masks found in test set. Pixel AUROC is skipped.")
 
