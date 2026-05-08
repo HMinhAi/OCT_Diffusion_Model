@@ -154,19 +154,25 @@ def _build_pseudo_labels(
     noise_map: torch.Tensor,
     quantile: float,
 ) -> torch.Tensor:
+    # 1. Chuẩn hóa các bản đồ thành phần
     corrected_norm = min_max_normalize(corrected_map)
     feature_norm = min_max_normalize(feature_map)
     noise_norm = min_max_normalize(noise_map)
 
-    soft_map = (corrected_norm + feature_norm + noise_norm) / 3.0
+    # 2. Tạo bản đồ mềm (soft map) để lấy tín hiệu tổng hợp
+    # Tăng trọng số cho feature_norm vì nó thường chứa thông tin bệnh lý tốt trên OCT
+    soft_map = (0.5 * corrected_norm + 0.3 * feature_norm + 0.2 * noise_norm)
 
+    # 3. Tạo mặt nạ nhị phân (hard map) dựa trên ngưỡng quantile
     flat = soft_map.view(soft_map.shape[0], -1)
     q = max(0.0, min(1.0, float(quantile)))
     threshold = torch.quantile(flat, q=q, dim=1, keepdim=True)
     hard_map = (flat >= threshold).float().view_as(soft_map)
 
-    # Blend hard and soft pseudo labels for stable fusion training.
-    return 0.5 * soft_map + 0.5 * hard_map
+    # 4. TRẢ VỀ: Kết hợp Hard và Soft
+    # Việc nhân hard_map với soft_map giúp triệt tiêu các vùng nhiễu thấp 
+    # và chỉ giữ lại giá trị tại các vùng có khả năng là bệnh lý cao nhất
+    return hard_map * soft_map
 
 
 def _init_wandb(config: Dict, hw: Dict, disable_wandb: bool):
@@ -339,9 +345,7 @@ def train_fusion_module(
                     octaves=inf_cfg.get("simplex_octaves", 3)
                 )
                 
-                # Sửa lỗi viền ngay khi cache
-                c_map = apply_deviation_correction(inv_out.diffusion_map, f_map, inf_cfg.get("lambda_correction", 0.2))
-                
+                # Sửa lỗi viền ngay khi cache                
                 # Lưu batch vào cache
                 cache_data = {
                     "c_map": c_map.cpu(),
@@ -369,9 +373,9 @@ def train_fusion_module(
             c_map = data["c_map"].to(device)
             f_map = data["f_map"].to(device)
             n_map = data["n_map"].to(device)
-            
+            c_map = apply_deviation_correction(c_map, f_map, inf_cfg.get("lambda_correction", 0.2))
+
             # Tạo target nhãn giả (Pseudo Labels)
-            # Giảm quantile xuống 0.90 để bắt vùng bệnh rộng hơn, tránh nhiễu viền
             target = _build_pseudo_labels(c_map, f_map, n_map, quantile=inf_cfg.get("threshold_percentile", 90)/100.0)
             
             optimizer.zero_grad()
@@ -386,29 +390,25 @@ def train_fusion_module(
 
     return start_step
 
-def _build_pseudo_labels(c_map, f_map, n_map, quantile=0.9):
-    """
-    Cải tiến: Chỉ tạo nhãn giả khi các bản đồ bất thường đồng thuận
-    """
-    # Kết hợp các map để tìm vùng nghi ngờ chung
-    combined = (c_map + f_map + n_map) / 3.0
-    
-    # Tính ngưỡng động
-    thresh = torch.quantile(combined.view(combined.size(0), -1), quantile, dim=1)
-    thresh = thresh.view(-1, 1, 1, 1)
-    
-    # Tạo mask nhãn giả (0 hoặc 1)
-    mask = (combined > thresh).float()
-    
-    # # Giúp Fusion Module không bao giờ học các lỗi ở rìa ảnh
-    # h, w = mask.shape[-2:]
-    # pad = int(h * 0.06) # Bỏ qua 6% viền
-    # mask[:, :, :pad, :] = 0
-    # mask[:, :, -pad:, :] = 0
-    # mask[:, :, :, :pad] = 0
-    # mask[:, :, :, -pad:] = 0
-    
-    return mask
+def _build_pseudo_labels(
+    corrected_map: torch.Tensor,
+    feature_map: torch.Tensor,
+    noise_map: torch.Tensor,
+    quantile: float,
+) -> torch.Tensor:
+    corrected_norm = min_max_normalize(corrected_map)
+    feature_norm = min_max_normalize(feature_map)
+    noise_norm = min_max_normalize(noise_map)
+
+    soft_map = (corrected_norm + feature_norm + noise_norm) / 3.0
+
+    flat = soft_map.view(soft_map.shape[0], -1)
+    q = max(0.0, min(1.0, float(quantile)))
+    threshold = torch.quantile(flat, q=q, dim=1, keepdim=True)
+    hard_map = (flat >= threshold).float().view_as(soft_map)
+
+    # Blend hard and soft pseudo labels for stable fusion training.
+    return 0.5 * soft_map + 0.5 * hard_map
 
 
 def _init_models(config: Dict, device: torch.device):
@@ -477,7 +477,7 @@ def main() -> None:
 
     ddpm, feature_model, fusion_model = _init_models(config, device)
     # load diffusion model
-    diffusion_path = checkpoint_dir / "diffusion_best.pt" # Hoặc "diffusion_last.pt"
+    diffusion_path = checkpoint_dir / "diffusion_best.pt" 
     if diffusion_path.exists():
         LOGGER.info(f"Loading pretrained Diffusion from {diffusion_path}")
         global_step = 0
@@ -487,7 +487,7 @@ def main() -> None:
             ddpm.load_state_dict(checkpoint["model"])
         else:
             ddpm.load_state_dict(checkpoint)
-        ddpm.eval() # Cực kỳ quan trọng: Không train lại thì phải để eval
+        ddpm.eval() 
     else:
         LOGGER.error(f"Không tìm thấy file weights Diffusion tại {diffusion_path}!")
         global_step = train_diffusion(
