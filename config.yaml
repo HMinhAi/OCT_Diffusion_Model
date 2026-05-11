@@ -2,7 +2,7 @@ project:
   seed: 42
   output_dir: outputs
   checkpoint_dir: checkpoints
-  num_workers: auto
+  num_workers: 14
   device: auto
 
 dataset:
@@ -31,7 +31,7 @@ train:
   epochs_fusion: 20
   lr_diffusion: 1.0e-4
   lr_fusion: 1.0e-4
-  weight_decay: 0.0
+  weight_decay: 0.01
   amp: true
   log_interval: 20
   save_every: 5
@@ -40,7 +40,7 @@ train:
   max_test_images: 600
 
 diffusion:
-  timesteps: 500 #1000
+  timesteps: 50 #1000
   beta_start: 1.0e-4
   beta_end: 0.02
   model_channels: 32
