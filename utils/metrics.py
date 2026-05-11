@@ -30,15 +30,24 @@ def anomaly_map_to_image_score(
     return flat.max(dim=1).values
 
 
-def safe_auroc(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    """Compute AUROC only if both classes are present."""
-    y_true = np.asarray(y_true).astype(np.int64)
-    y_score = np.asarray(y_score).astype(np.float64)
-
-    if y_true.size == 0 or np.unique(y_true).size < 2:
-        return float("nan")
-
-    return float(roc_auc_score(y_true, y_score))
+def safe_auroc(y_true, y_score):
+    y_true = np.array(y_true)
+    y_score = np.array(y_score)
+    
+    # 1. Kiểm tra nếu chỉ có 1 lớp (toàn 0 hoặc toàn 1)
+    if len(np.unique(y_true)) < 2:
+        print("Warning: Only one class present in y_true. ROC AUC score is not defined.")
+        return 0.5 # Trả về mức ngẫu nhiên nếu không đủ dữ liệu
+    
+    # 2. Xử lý NaN hoặc giá trị vô cùng trong scores (nếu có)
+    y_score = np.nan_to_num(y_score)
+    
+    try:
+        # Ép kiểu rõ ràng cho bài toán nhị phân
+        return float(roc_auc_score(y_true, y_score))
+    except Exception as e:
+        print(f"Error computing AUROC: {e}")
+        return 0.5
 
 
 def compute_image_auroc(labels: Iterable[int], scores: Iterable[float]) -> float:

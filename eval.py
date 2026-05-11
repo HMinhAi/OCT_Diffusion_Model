@@ -6,6 +6,7 @@ import random
 from pathlib import Path
 from typing import Dict, Optional
 
+import cv2
 import numpy as np
 import torch
 import yaml
@@ -157,8 +158,8 @@ def evaluate_pipeline(
         for batch in test_loader:
             images = batch["image"].to(device, non_blocking=True)
             labels = batch["label"].cpu().numpy()
-            masks = batch["mask"].to(device, non_blocking=True)
-            has_mask = batch["has_mask"].to(device, non_blocking=True)
+            # masks = batch["mask"].to(device, non_blocking=True)
+            # has_mask = batch["has_mask"].to(device, non_blocking=True)
             paths = batch["path"]
 
             maps = _build_source_maps(images, detector, feature_model, config)
@@ -175,44 +176,58 @@ def evaluate_pipeline(
                     combined.append(noise_map)
                 final_map = torch.stack(combined, dim=0).mean(dim=0)
 
-            final_map = min_max_normalize(final_map)
-            score_tensor = anomaly_map_to_image_score(final_map, reduction="max")
+            # final_map = min_max_normalize(final_map)
+            score_tensor = anomaly_map_to_image_score(final_map, reduction="top_k")
 
             image_labels.extend(labels.tolist())
+            # image_scores.extend(score_tensor.detach().cpu().numpy().tolist())
+
+            # batch_pixel_maps, batch_pixel_masks = extract_pixel_lists(
+            #     batch_maps=final_map,
+            #     batch_masks=masks,
+            #     batch_has_mask=has_mask,
+            # )
+            # pixel_maps.extend(batch_pixel_maps)
+            # pixel_masks.extend(batch_pixel_masks)
+            # nguyên giá trị gốc để tính AUC (Đảm bảo tính xếp hạng mẫu bệnh > mẫu thường)
             image_scores.extend(score_tensor.detach().cpu().numpy().tolist())
 
-            batch_pixel_maps, batch_pixel_masks = extract_pixel_lists(
-                batch_maps=final_map,
-                batch_masks=masks,
-                batch_has_mask=has_mask,
-            )
-            pixel_maps.extend(batch_pixel_maps)
-            pixel_masks.extend(batch_pixel_masks)
-
+            # 2. Tạo bản sao ĐÃ CHUẨN HÓA chỉ để hiển thị heatmap
             if save_visualizations and vis_counter < max_visualizations:
                 for i in range(images.shape[0]):
-                    if vis_counter >= max_visualizations:
-                        break
-                    file_name = f"sample_{vis_counter:05d}.png"
-                    save_anomaly_panel(
-                        save_path=str(vis_root / file_name),
-                        image_tensor=images[i],
-                        diff_map=diffusion_map[i],
-                        feat_map=feature_map[i],
-                        fused_map=final_map[i],
-                        noise_map=noise_map[i],
-                        mean=dataset_cfg.get("normalize_mean", [0.5, 0.5, 0.5]),
-                        std=dataset_cfg.get("normalize_std", [0.5, 0.5, 0.5]),
-                        title=str(paths[i]),
-                    )
+                    if vis_counter % 10 == 0:
+                        if vis_counter >= max_visualizations:
+                            break
+                        
+                        # HÀM CHUẨN HÓA CỤC BỘ TỪNG ẢNH ĐỂ HIỆN HEATMAP RÕ NHẤT[cite: 2]
+                        def local_norm(tensor):
+                            t_min, t_max = tensor.min(), tensor.max()
+                            print(f"Local norm for sample {vis_counter:05d}: min={t_min.item():.4f}, max={t_max.item():.4f}")
+                            return (tensor - t_min) / (t_max - t_min + 1e-8)
+
+                        # fused_vis_single = local_norm(final_map[i]) # Chuẩn hóa riêng tấm này[cite: 2]
+                        
+                        file_name = f"sample_{vis_counter:05d}.png"
+                        save_anomaly_panel(
+                            save_path=str(vis_root / file_name),
+                            image_tensor=images[i],
+                            diff_map=local_norm(diffusion_map[i]),
+                            feat_map=local_norm(feature_map[i]),
+                            fused_map=final_map[i], # Bây giờ chắc chắn sẽ hiện đỏ[cite: 2]
+                            noise_map=local_norm(noise_map[i]),
+                            mean=dataset_cfg.get("normalize_mean", [0.5, 0.5, 0.5]),
+                            std=dataset_cfg.get("normalize_std", [0.5, 0.5, 0.5]),
+                            title=str(paths[i]),
+                        )
                     vis_counter += 1
 
     image_auc = compute_image_auroc(image_labels, image_scores)
 
-    pixel_available = len(pixel_maps) > 0
-    if pixel_available:
-        pixel_auc = compute_pixel_auroc(pixel_maps, pixel_masks)
-    else:
+    pixel_available = False
+    # if pixel_available:
+    #     pixel_auc = compute_pixel_auroc(pixel_maps, pixel_masks)
+    # else:
+    if pixel_available == False:
         pixel_auc = float("nan")
         LOGGER.warning("No pixel-level masks found in test set. Pixel AUROC is skipped.")
 

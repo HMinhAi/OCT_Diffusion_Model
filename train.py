@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from torch.optim import Adam
+from tqdm import tqdm
 
 try:
     import wandb
@@ -66,11 +67,11 @@ def apply_hardware_config(config: Dict, hw: Dict) -> Dict:
                 bs = 8
             else:
                 bs = 4
-            config[section][key] = bs
+            config[section][key] = 16
             LOGGER.info("Auto %s[%s]=%d  (vram=%.1fGB)", section, key, bs, vram_gb)
 
-    _resolve_batch("batch_size", "train", 8)
-    _resolve_batch("batch_size", "eval", 4)
+    _resolve_batch("batch_size", "train", 16)
+    _resolve_batch("batch_size", "eval", 16)
     return config
 
 
@@ -153,19 +154,25 @@ def _build_pseudo_labels(
     noise_map: torch.Tensor,
     quantile: float,
 ) -> torch.Tensor:
+    # 1. Chuẩn hóa các bản đồ thành phần
     corrected_norm = min_max_normalize(corrected_map)
     feature_norm = min_max_normalize(feature_map)
     noise_norm = min_max_normalize(noise_map)
 
-    soft_map = (corrected_norm + feature_norm + noise_norm) / 3.0
+    # 2. Tạo bản đồ mềm (soft map) để lấy tín hiệu tổng hợp
+    # Tăng trọng số cho feature_norm vì nó thường chứa thông tin bệnh lý tốt trên OCT
+    soft_map = (0.5 * corrected_norm + 0.3 * feature_norm + 0.2 * noise_norm)
 
+    # 3. Tạo mặt nạ nhị phân (hard map) dựa trên ngưỡng quantile
     flat = soft_map.view(soft_map.shape[0], -1)
     q = max(0.0, min(1.0, float(quantile)))
     threshold = torch.quantile(flat, q=q, dim=1, keepdim=True)
     hard_map = (flat >= threshold).float().view_as(soft_map)
 
-    # Blend hard and soft pseudo labels for stable fusion training.
-    return 0.5 * soft_map + 0.5 * hard_map
+    # 4. TRẢ VỀ: Kết hợp Hard và Soft
+    # Việc nhân hard_map với soft_map giúp triệt tiêu các vùng nhiễu thấp 
+    # và chỉ giữ lại giá trị tại các vùng có khả năng là bệnh lý cao nhất
+    return hard_map * soft_map
 
 
 def _init_wandb(config: Dict, hw: Dict, disable_wandb: bool):
@@ -292,131 +299,116 @@ def train_diffusion(
 
 
 def train_fusion_module(
-    ddpm: DDPM,
-    feature_model: MahalanobisFeatureModel,
-    fusion_model: Optional[AttentionFusionModule],
+    ddpm,
+    feature_model,
+    fusion_model,
     train_loader,
-    config: Dict,
-    device: torch.device,
-    checkpoint_dir: Path,
-    start_step: int,
-    wb_run,
-) -> int:
-    if fusion_model is None:
-        LOGGER.warning("Attention fusion disabled by ablation. Skipping fusion training.")
-        return start_step
-
+    config,
+    device,
+    checkpoint_dir,
+    start_step=0,
+    wb_run=None,
+):
     train_cfg = config["train"]
-    ablation = config["ablation"]
-
+    inf_cfg = config["inference"]
+    epochs = int(train_cfg.get("epochs_fusion", 20))
+    
+    # --- PHẦN CACHE LOGIC ---
+    cache_dir = Path(checkpoint_dir) / "fusion_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    cache_files = list(cache_dir.glob("batch_*.pt"))
+    
     detector = DiffusionInversionDetector(
         ddpm=ddpm,
-        anomaly_distance=str(config["diffusion"].get("anomaly_distance", "l1")),
-        inversion_steps=int(config["diffusion"].get("inversion_steps", 50)),
-        use_noise_space_error=bool(ablation.get("enable_noise_space_error", True)),
+        inversion_steps=inf_cfg.get("inversion_steps", 50),
+        use_noise_space_error=True
     )
 
-    optimizer = Adam(
-        fusion_model.parameters(),
-        lr=float(train_cfg.get("lr_fusion", 1e-4)),
-        weight_decay=float(train_cfg.get("weight_decay", 0.0)),
-    )
+    if len(cache_files) == 0:
+        LOGGER.info("Generating and Caching Anomaly Maps (First time only)...")
+        fusion_model.eval()
+        idx = 0
+        for batch in tqdm(train_loader, desc="Caching maps"):
+            img = batch["image"].to(device)
+            
+            with torch.no_grad():
+                # 1. Inversion Maps
+                inv_out = detector.invert(img)
+                # 2. Feature Maps
+                f_map = feature_model.mahalanobis_map(img, target_size=img.shape[-2:])
+                # 3. Noise Maps
+                n_map = detector.simplex_robust_anomaly(
+                    img, 
+                    runs=inf_cfg.get("simplex_runs", 4),
+                    noise_scale=inf_cfg.get("simplex_noise_scale", 0.08),
+                    octaves=inf_cfg.get("simplex_octaves", 3)
+                )
+                
+                # Sửa lỗi viền ngay khi cache                
+                # Lưu batch vào cache
+                cache_data = {
+                    "c_map": c_map.cpu(),
+                    "f_map": f_map.cpu(),
+                    "n_map": n_map.cpu()
+                }
+                torch.save(cache_data, cache_dir / f"batch_{idx}.pt")
+                idx += 1
+        cache_files = list(cache_dir.glob("batch_*.pt"))
 
-    use_amp = bool(train_cfg.get("amp", True)) and device.type == "cuda"
-    scaler = torch.amp.GradScaler(device="cuda", enabled=use_amp)
-
-    epochs = int(train_cfg.get("epochs_fusion", 20))
-    log_interval = int(train_cfg.get("log_interval", 20))
-    pseudo_quantile = float(train_cfg.get("pseudo_label_quantile", 0.9))
-
-    ddpm.eval()
-    feature_model.eval()
-
-    best_loss = float("inf")
-    global_step = start_step
-
+    # --- HUẤN LUYỆN FUSION TỪ CACHE ---
+    LOGGER.info(f"Training Fusion for {epochs} epochs using cached maps...")
+    optimizer = Adam(fusion_model.parameters(), lr=float(train_cfg.get("lr_fusion", 1e-4)))
+    
     for epoch in range(1, epochs + 1):
         fusion_model.train()
-        losses = []
+        epoch_loss = 0
+        
+        # Shuffle danh sách file cache mỗi epoch
+        import random
+        random.shuffle(cache_files)
+        
+        for cache_file in cache_files:
+            data = torch.load(cache_file)
+            c_map = data["c_map"].to(device)
+            f_map = data["f_map"].to(device)
+            n_map = data["n_map"].to(device)
+            c_map = apply_deviation_correction(c_map, f_map, inf_cfg.get("lambda_correction", 0.2))
 
-        for step, batch in enumerate(train_loader, start=1):
-            images = batch["image"].to(device, non_blocking=True)
+            # Tạo target nhãn giả (Pseudo Labels)
+            target = _build_pseudo_labels(c_map, f_map, n_map, quantile=inf_cfg.get("threshold_percentile", 90)/100.0)
+            
+            optimizer.zero_grad()
+            fused, _ = fusion_model(c_map, f_map, n_map)
+            
+            loss = F.mse_loss(fused, target)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            
+        LOGGER.info(f"Epoch {epoch}/{epochs} - Fusion Loss: {epoch_loss/len(cache_files):.6f}")
 
-            with torch.no_grad():
-                corrected_map, feature_map, noise_map = _compute_maps_for_fusion_training(
-                    images=images,
-                    detector=detector,
-                    feature_model=feature_model,
-                    config=config,
-                )
+    return start_step
 
-                corrected_norm = min_max_normalize(corrected_map)
-                feature_norm = min_max_normalize(feature_map)
-                noise_norm = min_max_normalize(noise_map)
+def _build_pseudo_labels(
+    corrected_map: torch.Tensor,
+    feature_map: torch.Tensor,
+    noise_map: torch.Tensor,
+    quantile: float,
+) -> torch.Tensor:
+    corrected_norm = min_max_normalize(corrected_map)
+    feature_norm = min_max_normalize(feature_map)
+    noise_norm = min_max_normalize(noise_map)
 
-                pseudo_target = _build_pseudo_labels(
-                    corrected_map=corrected_map,
-                    feature_map=feature_map,
-                    noise_map=noise_map,
-                    quantile=pseudo_quantile,
-                )
+    soft_map = (corrected_norm + feature_norm + noise_norm) / 3.0
 
-            optimizer.zero_grad(set_to_none=True)
+    flat = soft_map.view(soft_map.shape[0], -1)
+    q = max(0.0, min(1.0, float(quantile)))
+    threshold = torch.quantile(flat, q=q, dim=1, keepdim=True)
+    hard_map = (flat >= threshold).float().view_as(soft_map)
 
-            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-                fused_map, weights = fusion_model(
-                    a_diff=corrected_norm,
-                    a_feat=feature_norm,
-                    a_noise=noise_norm,
-                )
-                fused_norm = min_max_normalize(fused_map)
-                loss = F.mse_loss(fused_norm, pseudo_target)
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            loss_value = float(loss.item())
-            losses.append(loss_value)
-            global_step += 1
-
-            if wb_run is not None and (global_step % log_interval == 0):
-                wb_run.log(
-                    {
-                        "train/fusion_loss_step": loss_value,
-                        "train/fusion_alpha_mean": float(weights["alpha"].mean().item()),
-                        "train/fusion_beta_mean": float(weights["beta"].mean().item()),
-                        "train/fusion_gamma_mean": float(weights["gamma"].mean().item()),
-                        "train/global_step": global_step,
-                    },
-                    step=global_step,
-                )
-
-        epoch_loss = float(np.mean(losses)) if losses else float("inf")
-        LOGGER.info("[Fusion] Epoch %d/%d - loss=%.6f", epoch, epochs, epoch_loss)
-
-        save_checkpoint(
-            checkpoint_dir / "fusion_last.pt",
-            {"model": fusion_model.state_dict(), "epoch": epoch, "loss": epoch_loss},
-        )
-
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
-            save_checkpoint(
-                checkpoint_dir / "fusion_best.pt",
-                {"model": fusion_model.state_dict(), "epoch": epoch, "loss": best_loss},
-            )
-
-        if wb_run is not None:
-            wb_run.log(
-                {
-                    "train/fusion_loss_epoch": epoch_loss,
-                    "train/fusion_best_loss": best_loss,
-                },
-                step=global_step,
-            )
-
-    return global_step
+    # Blend hard and soft pseudo labels for stable fusion training.
+    return 0.5 * soft_map + 0.5 * hard_map
 
 
 def _init_models(config: Dict, device: torch.device):
@@ -428,7 +420,7 @@ def _init_models(config: Dict, device: torch.device):
         pretrained=bool(feature_cfg.get("pretrained", True)),
         diagonal_covariance=bool(feature_cfg.get("diagonal_covariance", True)),
         covariance_eps=float(feature_cfg.get("covariance_eps", 1e-3)),
-        fit_max_samples=int(feature_cfg.get("fit_max_samples", 20000)),
+        fit_max_samples=int(feature_cfg.get("fit_max_samples", 3000)),
     ).to(device)
 
     fusion_model = None
@@ -484,8 +476,21 @@ def main() -> None:
     test_loader = loaders["test"]
 
     ddpm, feature_model, fusion_model = _init_models(config, device)
-
-    global_step = train_diffusion(
+    # load diffusion model
+    diffusion_path = checkpoint_dir / "diffusion_best.pt" 
+    if diffusion_path.exists():
+        LOGGER.info(f"Loading pretrained Diffusion from {diffusion_path}")
+        global_step = 0
+        checkpoint = torch.load(diffusion_path, map_location=device)
+        # Nếu bạn lưu dạng payload {"model": state_dict, ...}
+        if isinstance(checkpoint, dict) and "model" in checkpoint:
+            ddpm.load_state_dict(checkpoint["model"])
+        else:
+            ddpm.load_state_dict(checkpoint)
+        ddpm.eval() 
+    else:
+        LOGGER.error(f"Không tìm thấy file weights Diffusion tại {diffusion_path}!")
+        global_step = train_diffusion(
         ddpm=ddpm,
         train_loader=train_loader,
         config=config,
@@ -494,10 +499,16 @@ def main() -> None:
         wb_run=wb_run,
     )
 
+
     if config["ablation"].get("enable_feature_correction", True):
-        LOGGER.info("Fitting normal feature distribution for deviation correction.")
-        feature_model.fit(train_loader=train_loader, device=device)
-        torch.save(feature_model.get_stats(), checkpoint_dir / "feature_stats.pt")
+        stats_path = checkpoint_dir / "feature_stats.pt"
+        if stats_path.exists():
+            LOGGER.info("Loading existing feature stats.")
+            feature_model.load_stats(torch.load(stats_path), device=device)
+        else:
+            LOGGER.info("Fitting normal feature distribution for deviation correction.")
+            feature_model.fit(train_loader=train_loader, device=device)
+            torch.save(feature_model.get_stats(), checkpoint_dir / "feature_stats.pt")
     else:
         LOGGER.warning("Feature correction disabled by ablation.")
 
