@@ -5,6 +5,7 @@ import copy
 import logging
 import os
 import random
+import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -99,7 +100,26 @@ def get_device(config: Dict) -> torch.device:
 
 def save_checkpoint(path: Path, payload: Dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, path)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    torch.save(payload, tmp_path)
+
+    last_error = None
+    for attempt in range(5):
+        try:
+            os.replace(tmp_path, path)
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.5 * (attempt + 1))
+
+    fallback_path = path.with_name(f"{path.stem}_{time.strftime('%Y%m%d_%H%M%S')}{path.suffix}")
+    os.replace(tmp_path, fallback_path)
+    LOGGER.warning(
+        "Could not replace checkpoint %s after retries (%s). Saved fallback checkpoint to %s",
+        path,
+        last_error,
+        fallback_path,
+    )
 
 
 def _compute_maps_for_fusion_training(

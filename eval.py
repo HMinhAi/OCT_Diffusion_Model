@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import random
 from pathlib import Path
@@ -192,6 +193,7 @@ def evaluate_pipeline(
     image_scores = []
     pixel_maps = []
     pixel_masks = []
+    debug_rows = []
 
     save_visualizations = bool(eval_cfg.get("save_visualizations", True))
     max_visualizations = int(eval_cfg.get("max_visualizations", 50))
@@ -232,6 +234,12 @@ def evaluate_pipeline(
 
             final_map = _smooth_anomaly_map(final_map, kernel_size=5) * valid_mask
             score_tensor = anomaly_map_to_image_score(final_map, reduction="top_k")
+            final_max_tensor = anomaly_map_to_image_score(final_map, reduction="max")
+            final_top_tensor = anomaly_map_to_image_score(final_map, reduction="top_percent")
+            final_mean_tensor = anomaly_map_to_image_score(final_map, reduction="mean")
+            diff_top_tensor = anomaly_map_to_image_score(fusion_corrected_map, reduction="top_percent")
+            feat_top_tensor = anomaly_map_to_image_score(fusion_feature_map, reduction="top_percent")
+            noise_top_tensor = anomaly_map_to_image_score(fusion_noise_map, reduction="top_percent")
 
             image_labels.extend(labels.tolist())
             # image_scores.extend(score_tensor.detach().cpu().numpy().tolist())
@@ -245,6 +253,20 @@ def evaluate_pipeline(
             # pixel_masks.extend(batch_pixel_masks)
             # nguyên giá trị gốc để tính AUC (Đảm bảo tính xếp hạng mẫu bệnh > mẫu thường)
             image_scores.extend(score_tensor.detach().cpu().numpy().tolist())
+            for i, path in enumerate(paths):
+                debug_rows.append(
+                    {
+                        "path": str(path),
+                        "label": int(labels[i]),
+                        "final_score": float(score_tensor[i].detach().cpu().item()),
+                        "final_max": float(final_max_tensor[i].detach().cpu().item()),
+                        "final_top_percent": float(final_top_tensor[i].detach().cpu().item()),
+                        "final_mean": float(final_mean_tensor[i].detach().cpu().item()),
+                        "diffusion_top_percent": float(diff_top_tensor[i].detach().cpu().item()),
+                        "feature_top_percent": float(feat_top_tensor[i].detach().cpu().item()),
+                        "noise_top_percent": float(noise_top_tensor[i].detach().cpu().item()),
+                    }
+                )
 
             # 2. Tạo bản sao ĐÃ CHUẨN HÓA chỉ để hiển thị heatmap
             if save_visualizations and vis_counter < max_visualizations:
@@ -257,6 +279,7 @@ def evaluate_pipeline(
                         # fused_vis_single = local_norm(final_map[i]) # Chuẩn hóa riêng tấm này[cite: 2]
                         
                         file_name = f"sample_{vis_counter:05d}.png"
+                        print('save image:  ', vis_counter, ' - ', file_name)
                         save_anomaly_panel(
                             save_path=str(vis_root / file_name),
                             image_tensor=images[i],
@@ -285,6 +308,13 @@ def evaluate_pipeline(
         pixel_auc=pixel_auc,
         pixel_available=pixel_available,
     )
+    if debug_rows:
+        report_path = vis_root.parent / "eval_debug_scores.csv"
+        with report_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=list(debug_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(debug_rows)
+        LOGGER.info("Saved eval debug score report: %s", report_path)
 
     LOGGER.info("Evaluation metrics: %s", metrics)
     return metrics
