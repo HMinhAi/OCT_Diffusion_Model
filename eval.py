@@ -216,8 +216,8 @@ def evaluate_pipeline(
             noise_map = maps["noise_map"]
             corrected_map = maps["corrected_map"]
             valid_mask = _build_oct_valid_mask(images)
-            fusion_corrected_map, fusion_feature_map, fusion_noise_map = _prepare_fusion_inputs(
-                corrected_map,
+            fusion_diffusion_map, fusion_feature_map, fusion_noise_map = _prepare_fusion_inputs(
+                diffusion_map,
                 feature_map,
                 noise_map,
                 valid_mask=valid_mask,
@@ -225,9 +225,9 @@ def evaluate_pipeline(
             diffusion_vis_map = min_max_normalize(diffusion_map * valid_mask)
 
             if fusion_model is not None and ablation.get("enable_attention_fusion", True):
-                final_map, _ = fusion_model(fusion_corrected_map, fusion_feature_map, fusion_noise_map)
+                final_map, _ = fusion_model(fusion_diffusion_map, fusion_feature_map, fusion_noise_map)
             else:
-                combined = [fusion_corrected_map]
+                combined = [fusion_diffusion_map]
                 if ablation.get("enable_simplex_noise", True):
                     combined.append(fusion_noise_map)
                 final_map = torch.stack(combined, dim=0).mean(dim=0)
@@ -237,7 +237,7 @@ def evaluate_pipeline(
             final_max_tensor = anomaly_map_to_image_score(final_map, reduction="max")
             final_top_tensor = anomaly_map_to_image_score(final_map, reduction="top_percent")
             final_mean_tensor = anomaly_map_to_image_score(final_map, reduction="mean")
-            diff_top_tensor = anomaly_map_to_image_score(fusion_corrected_map, reduction="top_percent")
+            diff_top_tensor = anomaly_map_to_image_score(fusion_diffusion_map, reduction="top_percent")
             feat_top_tensor = anomaly_map_to_image_score(fusion_feature_map, reduction="top_percent")
             noise_top_tensor = anomaly_map_to_image_score(fusion_noise_map, reduction="top_percent")
 

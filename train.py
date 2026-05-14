@@ -182,7 +182,7 @@ def _build_pseudo_labels(
 
     # 2. Tạo bản đồ mềm (soft map) để lấy tín hiệu tổng hợp
     # Tăng trọng số cho feature_norm vì nó thường chứa thông tin bệnh lý tốt trên OCT
-    soft_map = 0.25 * feature_norm + 0.45 * corrected_norm + 0.30 * noise_norm
+    soft_map = 0.70 * corrected_norm + 0.20 * feature_norm + 0.10 * noise_norm
     soft_map = _smooth_anomaly_map(soft_map, kernel_size=7)
 
     # 3. Tạo mặt nạ nhị phân (hard map) dựa trên ngưỡng quantile
@@ -397,7 +397,7 @@ def train_fusion_module(
     epochs = int(train_cfg.get("epochs_fusion", 20))
     
     # --- PHẦN CACHE LOGIC ---
-    cache_dir = Path(checkpoint_dir) / "fusion_cache_blob_v5"
+    cache_dir = Path(checkpoint_dir) / "fusion_cache_diffusion_raw_v1"
     cache_dir.mkdir(parents=True, exist_ok=True)
     
     cache_files = list(cache_dir.glob("batch_*.pt"))
@@ -420,7 +420,7 @@ def train_fusion_module(
                 valid_mask = _build_oct_valid_mask(img)
                 # 1. Inversion Maps
                 inv_out = detector.invert(img)
-                c_map = inv_out.combined_map
+                c_map = inv_out.diffusion_map
                 # 2. Feature Maps
                 f_map = feature_model.mahalanobis_map(img, target_size=img.shape[-2:])
                 # 3. Noise Maps
@@ -437,7 +437,7 @@ def train_fusion_module(
                     "f_map": f_map.cpu(),
                     "n_map": n_map.cpu(),
                     "valid_mask": valid_mask.cpu(),
-                    "map_source": "combined_map",
+                    "map_source": "diffusion_map",
                 }
                 torch.save(cache_data, cache_dir / f"batch_{idx}.pt")
                 idx += 1
@@ -464,7 +464,6 @@ def train_fusion_module(
             valid_mask = data.get("valid_mask")
             if valid_mask is not None:
                 valid_mask = valid_mask.to(device)
-            c_map = apply_deviation_correction(c_map, f_map, inf_cfg.get("lambda_correction", 0.2))
             c_map, f_map, n_map = _prepare_fusion_inputs(c_map, f_map, n_map, valid_mask=valid_mask)
 
             # Tạo target nhãn giả (Pseudo Labels)
