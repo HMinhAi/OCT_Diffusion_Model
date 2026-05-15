@@ -1,0 +1,93 @@
+project:
+  seed: 42
+  output_dir: outputs
+  checkpoint_dir: checkpoints
+  num_workers: auto
+  device: auto
+
+dataset:
+  root: D:/Semester/NCKH/oct_diffusion/OCT_Diffusion_Model/datasets/OCT2017 
+  #/opt/ml/input/data/training/
+  train_dir: train
+  test_dir: test
+  normal_class_name: NORMAL
+  abnormal_class_names: [CNV, DME, DRUSEN]
+  mask_dir: masks
+  image_size: 128
+  normalize_mean: [0.5, 0.5, 0.5]
+  normalize_std: [0.5, 0.5, 0.5]
+  max_train_images: 3000
+  max_test_images: 600
+  use_kaggle_download: false
+  kaggle:
+    dataset_slug: paultimothymooney/kermany2018
+    download_dir: data
+    unzip: true
+
+train:
+  batch_size: auto
+  epochs_diffusion: 35
+  epochs_fusion: 20
+  lr_diffusion: 1.0e-4
+  lr_fusion: 1.0e-4
+  ema_decay: 0.999
+  weight_decay: 0.0
+  amp: true
+  log_interval: 20
+  save_every: 5
+  pseudo_label_quantile: 0.9
+  max_train_images: 3000
+  max_test_images: 600
+
+diffusion:
+  timesteps: 500 #1000
+  beta_start: 1.0e-4
+  beta_end: 0.02
+  model_channels: 32
+  channel_mult: [1, 2, 4, 4]  #[1, 2, 4, 8]
+  num_res_blocks: 2
+  dropout: 0.1
+  anomaly_distance: l2
+  inversion_steps: 40  # số lần chạy Unet
+
+inference:
+  simplex_noise_scale: 0.05
+  simplex_octaves: 3
+  simplex_runs: 5
+  noise_aggregate: mean
+  lambda_correction: 0.5
+  score_blend_noise_weight: 0.3
+  threshold_percentile: 98
+
+feature:
+  backbone: resnet50    
+  pretrained: true         
+  layer: layer3
+  layers: [layer2, layer3]
+  diagonal_covariance: true 
+  covariance_eps: 1.0e-3     
+  fit_max_samples: 3000
+
+fusion:
+  hidden_channels: 64
+
+ablation:
+  enable_diffusion: true
+  enable_feature_correction: true
+  enable_simplex_noise: true
+  enable_attention_fusion: true
+  enable_noise_space_error: false
+
+wandb:
+  enabled: true
+  project: oct-diffusion
+  entity: null
+  name: null
+  tags: [ddpm, inversion, oct, anomaly]
+  mode: online
+  log_images_every: 100
+
+eval:
+  batch_size: 16
+  save_visualizations: true
+  max_visualizations: 600

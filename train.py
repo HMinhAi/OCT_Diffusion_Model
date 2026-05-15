@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover
     wandb = None
 
 from datasets.oct_dataset import create_oct_dataloaders
-from eval import evaluate_pipeline
+from eval import MAP_NORM_STATS_NAME, _robust_normalize, evaluate_pipeline, fit_map_normalization_stats
 from models.attention_fusion import AttentionFusionModule
 from models.diffusion_model import DDPM, build_ddpm_from_config
 from models.feature_extractor import MahalanobisFeatureModel
@@ -122,6 +122,32 @@ def save_checkpoint(path: Path, payload: Dict) -> None:
     )
 
 
+def _clone_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {name: tensor.detach().clone() for name, tensor in state_dict.items()}
+
+
+def _update_ema_state(
+    ema_state: Dict[str, torch.Tensor],
+    model_state: Dict[str, torch.Tensor],
+    decay: float,
+) -> None:
+    with torch.no_grad():
+        for name, tensor in model_state.items():
+            if not torch.is_floating_point(tensor):
+                ema_state[name] = tensor.detach().clone()
+                continue
+            ema_state[name].mul_(decay).add_(tensor.detach(), alpha=1.0 - decay)
+
+
+def _load_diffusion_state(ddpm: DDPM, checkpoint: Dict) -> None:
+    if isinstance(checkpoint, dict):
+        state = checkpoint.get("ema_model") or checkpoint.get("model")
+        if state is not None:
+            ddpm.load_state_dict(state)
+            return
+    ddpm.load_state_dict(checkpoint)
+
+
 def _compute_maps_for_fusion_training(
     images: torch.Tensor,
     detector: DiffusionInversionDetector,
@@ -212,15 +238,16 @@ def _build_pseudo_labels(
     return _smooth_anomaly_map(blob_mask * soft_map, kernel_size=11)
 
 
-def _build_oct_valid_mask(images: torch.Tensor, border_margin: int = 8) -> torch.Tensor:
+def _build_oct_valid_mask(images: torch.Tensor, border_margin: int = 14) -> torch.Tensor:
     image01 = torch.clamp((images + 1.0) * 0.5, min=0.0, max=1.0)
     gray = image01.mean(dim=1, keepdim=True)
     smooth = F.avg_pool2d(gray, kernel_size=15, stride=1, padding=7)
     flat = smooth.view(smooth.shape[0], -1)
-    threshold = torch.quantile(flat, q=0.55, dim=1, keepdim=True).view(-1, 1, 1, 1)
+    threshold = torch.quantile(flat, q=0.60, dim=1, keepdim=True).view(-1, 1, 1, 1)
     tissue_mask = (smooth >= threshold).float()
-    tissue_mask = (F.avg_pool2d(tissue_mask, kernel_size=25, stride=1, padding=12) > 0.02).float()
-    tissue_mask = F.avg_pool2d(tissue_mask, kernel_size=9, stride=1, padding=4)
+    tissue_mask = (F.avg_pool2d(tissue_mask, kernel_size=21, stride=1, padding=10) > 0.20).float()
+    tissue_mask = (F.avg_pool2d(tissue_mask, kernel_size=11, stride=1, padding=5) > 0.98).float()
+    tissue_mask = F.avg_pool2d(tissue_mask, kernel_size=7, stride=1, padding=3)
 
     if border_margin <= 0:
         return tissue_mask
@@ -228,8 +255,6 @@ def _build_oct_valid_mask(images: torch.Tensor, border_margin: int = 8) -> torch
     border_mask = torch.ones_like(tissue_mask)
     border_mask[:, :, :border_margin, :] = 0.0
     border_mask[:, :, -border_margin:, :] = 0.0
-    border_mask[:, :, :, :border_margin] = 0.0
-    border_mask[:, :, :, -border_margin:] = 0.0
     return tissue_mask * border_mask
 
 
@@ -238,11 +263,18 @@ def _prepare_fusion_inputs(
     feature_map: torch.Tensor,
     noise_map: torch.Tensor,
     valid_mask: Optional[torch.Tensor] = None,
+    norm_stats: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if valid_mask is not None:
         corrected_map = corrected_map * valid_mask
         feature_map = feature_map * valid_mask
         noise_map = noise_map * valid_mask
+    if norm_stats is not None:
+        return (
+            _robust_normalize(corrected_map, norm_stats["diffusion"]),
+            _robust_normalize(feature_map, norm_stats["feature"]),
+            _robust_normalize(noise_map, norm_stats["noise"]),
+        )
     return (
         min_max_normalize(corrected_map),
         min_max_normalize(feature_map),
@@ -312,6 +344,8 @@ def train_diffusion(
     epochs = int(train_cfg.get("epochs_diffusion", 100))
     log_interval = int(train_cfg.get("log_interval", 20))
     save_every = int(train_cfg.get("save_every", 5))
+    ema_decay = float(train_cfg.get("ema_decay", 0.999))
+    ema_state = _clone_state_dict(ddpm.state_dict())
 
     best_loss = float("inf")
     global_step = 0
@@ -331,6 +365,7 @@ def train_diffusion(
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            _update_ema_state(ema_state, ddpm.state_dict(), decay=ema_decay)
 
             loss_value = float(loss.item())
             epoch_losses.append(loss_value)
@@ -351,20 +386,38 @@ def train_diffusion(
 
         save_checkpoint(
             checkpoint_dir / "diffusion_last.pt",
-            {"model": ddpm.state_dict(), "epoch": epoch, "loss": epoch_loss},
+            {
+                "model": ddpm.state_dict(),
+                "ema_model": ema_state,
+                "ema_decay": ema_decay,
+                "epoch": epoch,
+                "loss": epoch_loss,
+            },
         )
 
         if epoch % save_every == 0:
             save_checkpoint(
                 checkpoint_dir / f"diffusion_epoch_{epoch:03d}.pt",
-                {"model": ddpm.state_dict(), "epoch": epoch, "loss": epoch_loss},
+                {
+                    "model": ddpm.state_dict(),
+                    "ema_model": ema_state,
+                    "ema_decay": ema_decay,
+                    "epoch": epoch,
+                    "loss": epoch_loss,
+                },
             )
 
         if epoch_loss < best_loss:
             best_loss = epoch_loss
             save_checkpoint(
                 checkpoint_dir / "diffusion_best.pt",
-                {"model": ddpm.state_dict(), "epoch": epoch, "loss": best_loss},
+                {
+                    "model": ddpm.state_dict(),
+                    "ema_model": ema_state,
+                    "ema_decay": ema_decay,
+                    "epoch": epoch,
+                    "loss": best_loss,
+                },
             )
 
         if wb_run is not None:
@@ -397,7 +450,7 @@ def train_fusion_module(
     epochs = int(train_cfg.get("epochs_fusion", 20))
     
     # --- PHẦN CACHE LOGIC ---
-    cache_dir = Path(checkpoint_dir) / "fusion_cache_diffusion_raw_v1"
+    cache_dir = Path(checkpoint_dir) / "fusion_cache_robustnorm_padim_l23_v1"
     cache_dir.mkdir(parents=True, exist_ok=True)
     
     cache_files = list(cache_dir.glob("batch_*.pt"))
@@ -447,6 +500,9 @@ def train_fusion_module(
     LOGGER.info(f"Training Fusion for {epochs} epochs using cached maps...")
     optimizer = Adam(fusion_model.parameters(), lr=float(train_cfg.get("lr_fusion", 1e-4)))
     best_loss = float("inf")
+    norm_stats = config.get("_map_norm_stats")
+    if norm_stats is None:
+        LOGGER.warning("Map normalization stats missing. Falling back to per-image min-max normalization.")
     
     for epoch in range(1, epochs + 1):
         fusion_model.train()
@@ -464,9 +520,14 @@ def train_fusion_module(
             valid_mask = data.get("valid_mask")
             if valid_mask is not None:
                 valid_mask = valid_mask.to(device)
-            c_map, f_map, n_map = _prepare_fusion_inputs(c_map, f_map, n_map, valid_mask=valid_mask)
+            c_map, f_map, n_map = _prepare_fusion_inputs(
+                c_map,
+                f_map,
+                n_map,
+                valid_mask=valid_mask,
+                norm_stats=norm_stats,
+            )
 
-            # Tạo target nhãn giả (Pseudo Labels)
             target = _build_pseudo_labels(
                 c_map,
                 f_map,
@@ -506,8 +567,12 @@ def _init_models(config: Dict, device: torch.device):
     ddpm = build_ddpm_from_config(config).to(device)
 
     feature_cfg = config["feature"]
+    layer_names = feature_cfg.get("layers")
+    if layer_names is None:
+        layer_names = [str(feature_cfg.get("layer", "layer3"))]
     feature_model = MahalanobisFeatureModel(
         layer_name=str(feature_cfg.get("layer", "layer3")),
+        layer_names=layer_names,
         pretrained=bool(feature_cfg.get("pretrained", True)),
         diagonal_covariance=bool(feature_cfg.get("diagonal_covariance", True)),
         covariance_eps=float(feature_cfg.get("covariance_eps", 1e-3)),
@@ -573,11 +638,7 @@ def main() -> None:
         LOGGER.info(f"Loading pretrained Diffusion from {diffusion_path}")
         global_step = 0
         checkpoint = torch.load(diffusion_path, map_location=device)
-        # Nếu bạn lưu dạng payload {"model": state_dict, ...}
-        if isinstance(checkpoint, dict) and "model" in checkpoint:
-            ddpm.load_state_dict(checkpoint["model"])
-        else:
-            ddpm.load_state_dict(checkpoint)
+        _load_diffusion_state(ddpm, checkpoint)
         ddpm.eval() 
     else:
         LOGGER.error(f"Không tìm thấy file weights Diffusion tại {diffusion_path}!")
@@ -594,14 +655,35 @@ def main() -> None:
     if config["ablation"].get("enable_feature_correction", True):
         stats_path = checkpoint_dir / "feature_stats.pt"
         if stats_path.exists():
-            LOGGER.info("Loading existing feature stats.")
-            feature_model.load_stats(torch.load(stats_path), device=device)
+            stats = torch.load(stats_path, map_location="cpu")
+            if feature_model.is_stats_compatible(stats):
+                LOGGER.info("Loading existing spatial PaDiM feature stats.")
+                feature_model.load_stats(stats, device=device)
+            else:
+                LOGGER.warning("Feature stats are stale/incompatible. Re-fitting spatial PaDiM stats.")
+                feature_model.fit(train_loader=train_loader, device=device)
+                save_checkpoint(stats_path, feature_model.get_stats())
         else:
             LOGGER.info("Fitting normal feature distribution for deviation correction.")
             feature_model.fit(train_loader=train_loader, device=device)
-            torch.save(feature_model.get_stats(), checkpoint_dir / "feature_stats.pt")
+            save_checkpoint(checkpoint_dir / "feature_stats.pt", feature_model.get_stats())
     else:
         LOGGER.warning("Feature correction disabled by ablation.")
+
+    map_norm_stats_path = checkpoint_dir / MAP_NORM_STATS_NAME
+    if map_norm_stats_path.exists():
+        LOGGER.info("Loading existing map normalization stats.")
+        config["_map_norm_stats"] = torch.load(map_norm_stats_path, map_location="cpu")
+    else:
+        LOGGER.info("Fitting robust map normalization stats from train-normal set.")
+        config["_map_norm_stats"] = fit_map_normalization_stats(
+            config=config,
+            ddpm=ddpm,
+            feature_model=feature_model,
+            train_loader=train_loader,
+            device=device,
+        )
+        save_checkpoint(map_norm_stats_path, config["_map_norm_stats"])
 
     global_step = train_fusion_module(
         ddpm=ddpm,

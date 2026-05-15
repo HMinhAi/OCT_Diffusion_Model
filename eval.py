@@ -35,6 +35,8 @@ from utils.visualization import save_anomaly_panel
 
 LOGGER = logging.getLogger("oct_eval")
 
+MAP_NORM_STATS_NAME = "map_norm_stats.pt"
+
 
 def load_config(config_path: str) -> Dict:
     with open(config_path, "r", encoding="utf-8") as file:
@@ -62,7 +64,10 @@ def _load_model_checkpoint(model: torch.nn.Module, ckpt_path: Path) -> bool:
     if not ckpt_path.exists():
         return False
     payload = torch.load(ckpt_path, map_location="cpu")
-    state = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
+    if isinstance(payload, dict) and "ema_model" in payload:
+        state = payload["ema_model"]
+    else:
+        state = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
     model.load_state_dict(state)
     return True
 
@@ -123,11 +128,18 @@ def _prepare_fusion_inputs(
     feature_map: torch.Tensor,
     noise_map: torch.Tensor,
     valid_mask: Optional[torch.Tensor] = None,
+    norm_stats: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if valid_mask is not None:
         corrected_map = corrected_map * valid_mask
         feature_map = feature_map * valid_mask
         noise_map = noise_map * valid_mask
+    if norm_stats is not None:
+        return (
+            _robust_normalize(corrected_map, norm_stats["diffusion"]),
+            _robust_normalize(feature_map, norm_stats["feature"]),
+            _robust_normalize(noise_map, norm_stats["noise"]),
+        )
     return (
         min_max_normalize(corrected_map),
         min_max_normalize(feature_map),
@@ -135,15 +147,26 @@ def _prepare_fusion_inputs(
     )
 
 
-def _build_oct_valid_mask(images: torch.Tensor, border_margin: int = 8) -> torch.Tensor:
+def _robust_normalize(anomaly_map: torch.Tensor, stats: Dict[str, torch.Tensor]) -> torch.Tensor:
+    low = torch.as_tensor(stats["low"], device=anomaly_map.device, dtype=anomaly_map.dtype)
+    high = torch.as_tensor(stats["high"], device=anomaly_map.device, dtype=anomaly_map.dtype)
+    return torch.clamp((anomaly_map - low) / (high - low + 1e-8), 0.0, 1.0)
+
+
+def _score_raw_map(anomaly_map: torch.Tensor, valid_mask: torch.Tensor, reduction: str) -> torch.Tensor:
+    return anomaly_map_to_image_score(anomaly_map * valid_mask, reduction=reduction)
+
+
+def _build_oct_valid_mask(images: torch.Tensor, border_margin: int = 14) -> torch.Tensor:
     image01 = torch.clamp((images + 1.0) * 0.5, min=0.0, max=1.0)
     gray = image01.mean(dim=1, keepdim=True)
     smooth = F.avg_pool2d(gray, kernel_size=15, stride=1, padding=7)
     flat = smooth.view(smooth.shape[0], -1)
-    threshold = torch.quantile(flat, q=0.55, dim=1, keepdim=True).view(-1, 1, 1, 1)
+    threshold = torch.quantile(flat, q=0.60, dim=1, keepdim=True).view(-1, 1, 1, 1)
     tissue_mask = (smooth >= threshold).float()
-    tissue_mask = (F.avg_pool2d(tissue_mask, kernel_size=25, stride=1, padding=12) > 0.02).float()
-    tissue_mask = F.avg_pool2d(tissue_mask, kernel_size=9, stride=1, padding=4)
+    tissue_mask = (F.avg_pool2d(tissue_mask, kernel_size=21, stride=1, padding=10) > 0.20).float()
+    tissue_mask = (F.avg_pool2d(tissue_mask, kernel_size=11, stride=1, padding=5) > 0.98).float()
+    tissue_mask = F.avg_pool2d(tissue_mask, kernel_size=7, stride=1, padding=3)
 
     if border_margin <= 0:
         return tissue_mask
@@ -154,6 +177,52 @@ def _build_oct_valid_mask(images: torch.Tensor, border_margin: int = 8) -> torch
     border_mask[:, :, :, :border_margin] = 0.0
     border_mask[:, :, :, -border_margin:] = 0.0
     return tissue_mask * border_mask
+
+
+@torch.no_grad()
+def fit_map_normalization_stats(
+    config: Dict,
+    ddpm: DDPM,
+    feature_model: MahalanobisFeatureModel,
+    train_loader,
+    device: torch.device,
+    max_batches: int = 64,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    diffusion_cfg = config["diffusion"]
+    detector = DiffusionInversionDetector(
+        ddpm=ddpm,
+        anomaly_distance=str(diffusion_cfg.get("anomaly_distance", "l1")),
+        inversion_steps=int(diffusion_cfg.get("inversion_steps", 50)),
+        use_noise_space_error=bool(config["ablation"].get("enable_noise_space_error", True)),
+    )
+    values = {"diffusion": [], "feature": [], "noise": []}
+    ddpm.eval()
+    feature_model.eval()
+    for batch_idx, batch in enumerate(train_loader):
+        if batch_idx >= max_batches:
+            break
+        images = batch["image"].to(device, non_blocking=True)
+        maps = _build_source_maps(images, detector, feature_model, config)
+        valid_mask = _build_oct_valid_mask(images)
+        for key, source_key in [("diffusion", "diffusion_map"), ("feature", "feature_map"), ("noise", "noise_map")]:
+            source = maps[source_key] * valid_mask
+            valid_values = source[valid_mask > 0.05].detach().float().cpu()
+            if valid_values.numel() > 0:
+                values[key].append(valid_values)
+
+    stats = {}
+    for key, chunks in values.items():
+        if chunks:
+            merged = torch.cat(chunks)
+            low = torch.quantile(merged, 0.01)
+            high = torch.quantile(merged, 0.995)
+            if float(high - low) < 1e-6:
+                high = low + 1.0
+        else:
+            low = torch.tensor(0.0)
+            high = torch.tensor(1.0)
+        stats[key] = {"low": low.cpu(), "high": high.cpu()}
+    return stats
 
 
 def _smooth_anomaly_map(anomaly_map: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
@@ -198,6 +267,9 @@ def evaluate_pipeline(
     save_visualizations = bool(eval_cfg.get("save_visualizations", True))
     max_visualizations = int(eval_cfg.get("max_visualizations", 50))
     vis_counter = 0
+    norm_stats = config.get("_map_norm_stats")
+    if norm_stats is None:
+        LOGGER.warning("Map normalization stats not found. Falling back to per-image min-max normalization.")
 
     vis_root = Path(output_dir or config["project"].get("output_dir", "outputs")) / "eval_visuals"
     vis_root.mkdir(parents=True, exist_ok=True)
@@ -221,11 +293,14 @@ def evaluate_pipeline(
                 feature_map,
                 noise_map,
                 valid_mask=valid_mask,
+                norm_stats=norm_stats,
             )
-            diffusion_vis_map = min_max_normalize(diffusion_map * valid_mask)
+            diffusion_vis_map = fusion_diffusion_map
+            feature_vis_map = fusion_feature_map
 
+            attention_maps = None
             if fusion_model is not None and ablation.get("enable_attention_fusion", True):
-                final_map, _ = fusion_model(fusion_diffusion_map, fusion_feature_map, fusion_noise_map)
+                final_map, attention_maps = fusion_model(fusion_diffusion_map, fusion_feature_map, fusion_noise_map)
             else:
                 combined = [fusion_diffusion_map]
                 if ablation.get("enable_simplex_noise", True):
@@ -240,6 +315,20 @@ def evaluate_pipeline(
             diff_top_tensor = anomaly_map_to_image_score(fusion_diffusion_map, reduction="top_percent")
             feat_top_tensor = anomaly_map_to_image_score(fusion_feature_map, reduction="top_percent")
             noise_top_tensor = anomaly_map_to_image_score(fusion_noise_map, reduction="top_percent")
+            raw_diff_top_tensor = _score_raw_map(diffusion_map, valid_mask, reduction="top_percent")
+            raw_diff_mean_tensor = _score_raw_map(diffusion_map, valid_mask, reduction="mean")
+            raw_diff_max_tensor = _score_raw_map(diffusion_map, valid_mask, reduction="max")
+            raw_feat_top_tensor = _score_raw_map(feature_map, valid_mask, reduction="top_percent")
+            raw_feat_mean_tensor = _score_raw_map(feature_map, valid_mask, reduction="mean")
+            raw_feat_max_tensor = _score_raw_map(feature_map, valid_mask, reduction="max")
+            if attention_maps is not None:
+                alpha_mean_tensor = attention_maps["alpha"].mean(dim=(1, 2, 3))
+                beta_mean_tensor = attention_maps["beta"].mean(dim=(1, 2, 3))
+                gamma_mean_tensor = attention_maps["gamma"].mean(dim=(1, 2, 3))
+            else:
+                alpha_mean_tensor = torch.zeros_like(score_tensor)
+                beta_mean_tensor = torch.zeros_like(score_tensor)
+                gamma_mean_tensor = torch.zeros_like(score_tensor)
 
             image_labels.extend(labels.tolist())
             # image_scores.extend(score_tensor.detach().cpu().numpy().tolist())
@@ -265,6 +354,15 @@ def evaluate_pipeline(
                         "diffusion_top_percent": float(diff_top_tensor[i].detach().cpu().item()),
                         "feature_top_percent": float(feat_top_tensor[i].detach().cpu().item()),
                         "noise_top_percent": float(noise_top_tensor[i].detach().cpu().item()),
+                        "raw_diffusion_top_percent": float(raw_diff_top_tensor[i].detach().cpu().item()),
+                        "raw_diffusion_mean": float(raw_diff_mean_tensor[i].detach().cpu().item()),
+                        "raw_diffusion_max": float(raw_diff_max_tensor[i].detach().cpu().item()),
+                        "raw_feature_top_percent": float(raw_feat_top_tensor[i].detach().cpu().item()),
+                        "raw_feature_mean": float(raw_feat_mean_tensor[i].detach().cpu().item()),
+                        "raw_feature_max": float(raw_feat_max_tensor[i].detach().cpu().item()),
+                        "attn_alpha_mean": float(alpha_mean_tensor[i].detach().cpu().item()),
+                        "attn_beta_mean": float(beta_mean_tensor[i].detach().cpu().item()),
+                        "attn_gamma_mean": float(gamma_mean_tensor[i].detach().cpu().item()),
                     }
                 )
 
@@ -284,12 +382,16 @@ def evaluate_pipeline(
                             save_path=str(vis_root / file_name),
                             image_tensor=images[i],
                             diff_map=diffusion_vis_map[i],
-                            feat_map=fusion_feature_map[i],
+                            feat_map=feature_vis_map[i],
                             fused_map=final_map[i], # Bây giờ chắc chắn sẽ hiện đỏ[cite: 2]
                             noise_map=fusion_noise_map[i],
+                            attention_maps={
+                                key: value[i] for key, value in attention_maps.items()
+                            } if attention_maps is not None else None,
                             mean=dataset_cfg.get("normalize_mean", [0.5, 0.5, 0.5]),
                             std=dataset_cfg.get("normalize_std", [0.5, 0.5, 0.5]),
                             title=str(paths[i]),
+                            normalize_maps=False,
                         )
                     vis_counter += 1
 
@@ -324,8 +426,12 @@ def _init_models(config: Dict, device: torch.device):
     ddpm = build_ddpm_from_config(config).to(device)
 
     feature_cfg = config["feature"]
+    layer_names = feature_cfg.get("layers")
+    if layer_names is None:
+        layer_names = [str(feature_cfg.get("layer", "layer3"))]
     feature_model = MahalanobisFeatureModel(
         layer_name=str(feature_cfg.get("layer", "layer3")),
+        layer_names=layer_names,
         pretrained=bool(feature_cfg.get("pretrained", True)),
         diagonal_covariance=bool(feature_cfg.get("diagonal_covariance", True)),
         covariance_eps=float(feature_cfg.get("covariance_eps", 1e-3)),
@@ -367,11 +473,31 @@ def _load_all_checkpoints(
     feature_stats_path = ckpt_dir / "feature_stats.pt"
     if feature_stats_path.exists():
         stats = torch.load(feature_stats_path, map_location="cpu")
-        feature_model.load_stats(stats=stats, device=device)
-        LOGGER.info("Loaded feature stats: %s", feature_stats_path)
+        if feature_model.is_stats_compatible(stats):
+            feature_model.load_stats(stats=stats, device=device)
+            LOGGER.info("Loaded spatial PaDiM feature stats: %s", feature_stats_path)
+        else:
+            LOGGER.warning("Feature stats are stale/incompatible. Fitting spatial PaDiM stats before evaluation.")
+            feature_model.fit(train_loader=train_loader, device=device)
     else:
         LOGGER.warning("Feature stats not found. Fitting from train-normal set before evaluation.")
         feature_model.fit(train_loader=train_loader, device=device)
+
+    map_norm_stats_path = ckpt_dir / MAP_NORM_STATS_NAME
+    if map_norm_stats_path.exists():
+        config["_map_norm_stats"] = torch.load(map_norm_stats_path, map_location="cpu")
+        LOGGER.info("Loaded map normalization stats: %s", map_norm_stats_path)
+    else:
+        LOGGER.warning("Map normalization stats not found. Fitting from train-normal set before evaluation.")
+        config["_map_norm_stats"] = fit_map_normalization_stats(
+            config=config,
+            ddpm=ddpm,
+            feature_model=feature_model,
+            train_loader=train_loader,
+            device=device,
+        )
+        torch.save(config["_map_norm_stats"], map_norm_stats_path)
+        LOGGER.info("Saved map normalization stats: %s", map_norm_stats_path)
 
     use_attention_fusion = fusion_model is not None
     if fusion_model is not None:
