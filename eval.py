@@ -308,7 +308,7 @@ def evaluate_pipeline(
                 final_map = torch.stack(combined, dim=0).mean(dim=0)
 
             final_map = _smooth_anomaly_map(final_map, kernel_size=5) * valid_mask
-            score_tensor = anomaly_map_to_image_score(final_map, reduction="top_k")
+            score_tensor = anomaly_map_to_image_score(final_map, reduction="max")
             final_max_tensor = anomaly_map_to_image_score(final_map, reduction="max")
             final_top_tensor = anomaly_map_to_image_score(final_map, reduction="top_percent")
             final_mean_tensor = anomaly_map_to_image_score(final_map, reduction="mean")
@@ -366,15 +366,14 @@ def evaluate_pipeline(
                     }
                 )
 
-            # 2. Tạo bản sao ĐÃ CHUẨN HÓA chỉ để hiển thị heatmap
             if save_visualizations and vis_counter < max_visualizations:
                 for i in range(images.shape[0]):
                     if vis_counter % 10 == 0:
                         if vis_counter >= max_visualizations:
                             break
                         
-                        # HÀM CHUẨN HÓA CỤC BỘ TỪNG ẢNH ĐỂ HIỆN HEATMAP RÕ NHẤT[cite: 2]
-                        # fused_vis_single = local_norm(final_map[i]) # Chuẩn hóa riêng tấm này[cite: 2]
+                        # HÀM CHUẨN HÓA CỤC BỘ TỪNG ẢNH ĐỂ HIỆN HEATMAP RÕ NHẤT
+                        # fused_vis_single = local_norm(final_map[i]) # Chuẩn hóa riêng tấm này
                         
                         file_name = f"sample_{vis_counter:05d}.png"
                         print('save image:  ', vis_counter, ' - ', file_name)
@@ -383,7 +382,7 @@ def evaluate_pipeline(
                             image_tensor=images[i],
                             diff_map=diffusion_vis_map[i],
                             feat_map=feature_vis_map[i],
-                            fused_map=final_map[i], # Bây giờ chắc chắn sẽ hiện đỏ[cite: 2]
+                            fused_map=final_map[i], 
                             noise_map=fusion_noise_map[i],
                             attention_maps={
                                 key: value[i] for key, value in attention_maps.items()

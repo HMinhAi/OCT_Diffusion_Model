@@ -253,8 +253,9 @@ def _build_oct_valid_mask(images: torch.Tensor, border_margin: int = 14) -> torc
         return tissue_mask
 
     border_mask = torch.ones_like(tissue_mask)
-    border_mask[:, :, :border_margin, :] = 0.0
-    border_mask[:, :, -border_margin:, :] = 0.0
+    # border_mask[:, :, :border_margin, :] = 0.0
+    # border_mask[:, :, -border_margin:, :] = 0.0
+    return torch.ones((images.shape[0], 1, images.shape[-2], images.shape[-1]), device=images.device)
     return tissue_mask * border_mask
 
 

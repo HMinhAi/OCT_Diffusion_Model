@@ -1,0 +1,35 @@
+# --extra-index-url https://download.pytorch.org/whl/cu124
+# torch==2.6.0+cu124
+# torchvision==0.21.0+cu124
+
+# numpy>=1.26.4,<2.0.0
+# # protobuf>=3.20.3,<4.0.0
+
+# scikit-learn==1.6.1
+# scipy==1.15.3
+
+# wandb==0.16.6
+
+# Pillow==12.2.0
+# matplotlib==3.10.8
+# PyYAML==6.0.3
+
+# PyTorch GPU wheel — CUDA 12.8 (cu128) — required for Blackwell (RTX 5060 Ti, sm_120)
+# Install: pip install -r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.7.0+cu128
+torchvision==0.22.0+cu128
+
+# Data / numerics
+numpy==2.2.6
+scipy==1.15.3
+scikit-learn==1.7.2
+
+# Image & visualisation
+Pillow==12.2.0
+matplotlib==3.10.8
+
+# Config & logging
+PyYAML==6.0.3
+wandb==0.26.0
