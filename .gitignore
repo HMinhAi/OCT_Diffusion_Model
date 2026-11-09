@@ -1,0 +1,29 @@
+# Data & weights
+datasets/
+checkpoints*/
+*.pt
+*.pth
+*.bin
+*.onnx
+
+# Cache & environments
+__pycache__/
+*/__pycache__/
+*/*/__pycache__/
+.venv/
+env/
+venv/
+
+# Archives & logs
+*.zip
+*.tar.gz
+wandb/
+outputs/
+logs/
+*.log
+
+# Temp files
+tmp/
+scratch/
+tea_debug.log
+IEEEtran_test.cls
